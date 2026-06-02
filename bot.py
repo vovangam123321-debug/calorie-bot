@@ -8,10 +8,11 @@ from supabase import create_client
 
 import os
 
-BOT_TOKEN = os.getenv("8942059082:AAEkeNHQTd7-vWDDoarhqq-mVn-3bZBIX84")
-SUPABASE_URL = os.getenv("https://enhsspycsdbytmjbjoov.supabase.co")
-SUPABASE_KEY = os.getenv("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVuaHNzcHljc2RieXRtamJqb292Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzODMwOTMsImV4cCI6MjA5NTk1OTA5M30.2eZctXsKBOSl3xKiKVrQM-g9G8GLFnd5lZq_Q25FRVc")
+import os
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
