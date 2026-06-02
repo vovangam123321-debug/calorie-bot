@@ -7,8 +7,8 @@ from aiogram import Bot, Dispatcher, types
 from supabase import create_client
 
 import os
-
-import os
+import threading
+from flask import Flask
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -17,6 +17,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 
 def normalize_text(text: str) -> str:
@@ -247,4 +256,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    threading.Thread(target=run_web).start()
     asyncio.run(main())
