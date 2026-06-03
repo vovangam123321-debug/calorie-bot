@@ -135,6 +135,8 @@ def format_food_suggestions(items, grams=None):
 @dp.message()
 async def handle_message(message: types.Message):
     print("MESSAGE:", message.text, flush=True)
+
+    if not message.text:
         await message.answer("Пока я понимаю только текст. Фото еды добавим следующим этапом 📸")
         return
 
