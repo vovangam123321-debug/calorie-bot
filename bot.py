@@ -469,6 +469,47 @@ def ai_estimate_food_nutrition(name: str):
         return None
 
 
+
+def ai_choose_from_suggestions(user_line: str, grams: float, suggestions: list):
+    if not gemini_client or not suggestions:
+        return None
+    try:
+        options = [
+            {"index": i, "name": x.get("name"), "kcal": x.get("kcal_per_100g")}
+            for i, x in enumerate(suggestions[:10])
+        ]
+        prompt = f"""
+Пользователь написал: {user_line}
+Вес: {grams} г
+Варианты из базы:
+{json.dumps(options, ensure_ascii=False)}
+
+Выбери самый подходящий вариант.
+Верни ТОЛЬКО JSON:
+{{"index": число или null, "confidence": 0.0-1.0}}
+"""
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+        raw = resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        data = json.loads(raw)
+        idx = data.get("index")
+        conf = float(data.get("confidence") or 0)
+        if idx is None or conf < 0.50:
+            return None
+        idx = int(idx)
+        if 0 <= idx < len(suggestions[:10]):
+            return suggestions[idx]
+    except Exception as e:
+        print("AI CHOOSE ERROR:", e, flush=True)
+    return None
+
+
 async def try_ai_add_food_from_text(message: types.Message, original_text: str):
     guesses = ai_text_food_guess(original_text)
     if not guesses:
@@ -875,10 +916,40 @@ async def handle_message(message: types.Message):
 
         if not food:
             if suggestions:
-                suggestion_items.append((line, grams, suggestions))
+                chosen = ai_choose_from_suggestions(line, grams, suggestions)
+                if chosen:
+                    food = chosen
+                else:
+                    suggestion_items.append((line, grams, suggestions))
+                    continue
             else:
-                failed_items.append(line)
-            continue
+                ai_added = False
+                if gemini_client:
+                    guesses = ai_text_food_guess(line)
+                    if guesses:
+                        for g in guesses[:1]:
+                            ai_name = normalize_text(str(g.get("name", "")))
+                            ai_grams = g.get("grams") or grams
+                            try:
+                                ai_grams = float(ai_grams)
+                            except Exception:
+                                ai_grams = grams
+                            if ai_name:
+                                ai_food, ai_suggestions = find_food(ai_name)
+                                if not ai_food and ai_suggestions:
+                                    ai_food = ai_choose_from_suggestions(ai_name, ai_grams, ai_suggestions)
+                                if not ai_food:
+                                    ai_food = ai_estimate_food_nutrition(ai_name)
+                                    if ai_food:
+                                        upsert_food_from_external(ai_food)
+                                if ai_food:
+                                    food = ai_food
+                                    grams = ai_grams
+                                    ai_added = True
+                                    break
+                if not ai_added:
+                    failed_items.append(line)
+                    continue
 
         nutrition = calc_nutrition(food, grams)
 
