@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import random
 import threading
 from datetime import date
 
@@ -42,7 +43,7 @@ def main_menu():
             [KeyboardButton(text="➕ Добавить еду"), KeyboardButton(text="📊 Сегодня")],
             [KeyboardButton(text="📋 История"), KeyboardButton(text="🗑 Удалить последнюю")],
             [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🎯 Цели")],
-            [KeyboardButton(text="🍽 Продукты"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Напиши: рис вареный 200",
@@ -92,6 +93,65 @@ def parse_food_message(text: str):
     grams = float(match.group(1))
     food_name = text[:match.start()].strip()
     return (food_name, grams) if food_name else (None, None)
+
+
+FOOD_EXAMPLES = [
+    "рис вареный 200",
+    "курица жареная 150г",
+    "чечевица 180",
+    "банан 120",
+    "гречка 250",
+    "творог 200",
+    "картошка жареная 180",
+    "шаурма 300",
+    "яйцо 100",
+    "овсянка на молоке 250",
+]
+
+LIST_EXAMPLES = [
+    "рис вареный 200\nкурица жареная 150г\nбанан 120",
+    "гречка 250\nяйцо вареное 100\nчай 300",
+    "чечевица 180\nхлеб черный 50\nтворог 200",
+    "картошка жареная 200\nкурица 150\nкола 300",
+]
+
+
+def random_food_example():
+    return random.choice(FOOD_EXAMPLES)
+
+
+def random_list_example():
+    return random.choice(LIST_EXAMPLES)
+
+
+def split_food_lines(raw_text: str):
+    """
+    Делит одно сообщение на несколько продуктов.
+    Понимает:
+    рис 200
+    курица 150
+
+    Или:
+    рис 200; курица 150; банан 120
+
+    Не трогает команды /day, /start и т.д.
+    """
+    raw_text = raw_text.strip()
+    if raw_text.startswith("/"):
+        return [raw_text]
+
+    parts = []
+    for line in re.split(r"[\n;]+", raw_text):
+        line = line.strip()
+        if not line:
+            continue
+
+        # убираем маркеры списка
+        line = re.sub(r"^\s*[-•\d\.\)]\s*", "", line).strip()
+        if line:
+            parts.append(line)
+
+    return parts if parts else [raw_text]
 
 def get_food_exact(food_name):
     result = supabase.table("food_db").select("*").eq("name", food_name).execute()
@@ -397,7 +457,7 @@ async def handle_message(message: types.Message):
     if text in ("/start", "🔁 начать заново"):
         await start_onboarding(message); return
     if text in ("➕ добавить еду", "/add"):
-        await message.answer("Напиши еду и граммы:\nрис вареный 200\nкурица жареная 150г\nчечевица 180"); return
+        await message.answer("Напиши еду и граммы. Можно одним продуктом или списком:\n\n" + random_list_example()); return
     if text in ("📊 сегодня", "/day"):
         await message.answer(day_text(message.from_user.id), reply_markup=main_menu()); return
     if text in ("📋 история", "/history"):
@@ -420,7 +480,8 @@ async def handle_message(message: types.Message):
         await message.answer(profile_text(user), reply_markup=main_menu()); return
     if text in ("🎯 цели", "/goal", "⚙️ настройки", "/settings"):
         await message.answer("🎯 Что хочешь настроить?", reply_markup=settings_keyboard()); return
-    if text in ("🍽 продукты", "/foods"):
+    # Скрытая служебная команда для тебя. В меню её нет.
+    if text == "/foods_admin":
         foods = supabase.table("food_db").select("name").order("name").limit(300).execute().data
         chunks, current = [], "🍽 Продукты в базе, первые 300:\n\n"
         for x in foods:
@@ -433,11 +494,11 @@ async def handle_message(message: types.Message):
             await message.answer(chunk, reply_markup=main_menu())
         return
     if text in ("/help", "помощь"):
-        await message.answer("Примеры:\nрис вареный 200\nкурица жареная 150г\nсъел банан 200 грамм\nчечевица 180", reply_markup=main_menu()); return
+        await message.answer("Примеры одного продукта:\n" + random_food_example() + "\n\nМожно списком:\n" + random_list_example(), reply_markup=main_menu()); return
 
     food_name, grams = parse_food_message(text)
     if food_name is None or grams is None:
-        await message.answer("Я не понял 😕\nНапиши так: рис вареный 200", reply_markup=main_menu()); return
+        await message.answer("Я не понял 😕\nНапиши так:\n" + random_food_example() + "\n\nИли списком:\n" + random_list_example(), reply_markup=main_menu()); return
 
     food, suggestions = find_food(food_name)
     if not food:
