@@ -142,21 +142,21 @@ async def handle_message(message: types.Message):
 
     text = normalize_text(message.text)
 
-    if text == "/start":
-    await message.answer(
-        "Привет 👋\n\n"
-        "Я считаю калории и КБЖУ.\n\n"
-        "Пиши так:\n"
-        "• рис вареный 200\n"
-        "• курица жареная 150г\n"
-        "• chicken fried 180g\n\n"
-        "Команды:\n"
-        "/day — итог за сегодня\n"
-        "/foods — список продуктов\n"
-        "/history — что ты ел сегодня\n"
-        "/delete — удалить последнюю запись"
-    )
-    return
+      if text == "/start":
+        await message.answer(
+            "Привет 👋\n\n"
+            "Я считаю калории и КБЖУ.\n\n"
+            "Пиши так:\n"
+            "• рис вареный 200\n"
+            "• курица жареная 150г\n"
+            "• chicken fried 180g\n\n"
+            "Команды:\n"
+            "/day — итог за сегодня\n"
+            "/foods — список продуктов\n"
+            "/history — что ты ел сегодня\n"
+            "/delete — удалить последнюю запись"
+        )
+        return
 
     if text == "/foods":
         result = supabase.table("food_db").select("name").order("name").limit(120).execute()
