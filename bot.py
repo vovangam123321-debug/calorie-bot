@@ -853,35 +853,126 @@ async def handle_message(message: types.Message):
             reply_markup=main_menu()
         ); return
 
-    food_name, grams = parse_food_message(text)
-    if food_name is None or grams is None:
-        await message.answer("Я не понял 😕\nНапиши так:\n" + random_food_example() + "\n\nИли списком:\n" + random_list_example(), reply_markup=main_menu()); return
+    # =========================
+    # FOOD INPUT: one item OR list
+    # =========================
 
-    food, suggestions = find_food(food_name)
-    if not food:
-        if suggestions:
-            await message.answer(format_food_suggestions(suggestions, grams), reply_markup=main_menu())
+    food_lines = split_food_lines(raw_text)
+
+    added_items = []
+    failed_items = []
+    suggestion_items = []
+
+    for line in food_lines:
+        line_text = normalize_text(line)
+        food_name, grams = parse_food_message(line_text)
+
+        if food_name is None or grams is None:
+            failed_items.append(line)
+            continue
+
+        food, suggestions = find_food(food_name)
+
+        if not food:
+            if suggestions:
+                suggestion_items.append((line, grams, suggestions))
+            else:
+                failed_items.append(line)
+            continue
+
+        nutrition = calc_nutrition(food, grams)
+
+        supabase.table("food_logs").insert({
+            "telegram_id": message.from_user.id,
+            "food": food["name"],
+            "grams": grams,
+            "calories": nutrition["calories"],
+            "protein": nutrition["protein"],
+            "fat": nutrition["fat"],
+            "carbs": nutrition["carbs"],
+            "date": str(date.today())
+        }).execute()
+
+        added_items.append((food, grams, nutrition))
+
+    # Если ничего не добавили и это была одна строка — пробуем AI fallback
+    if not added_items and len(food_lines) == 1:
+        if await try_ai_add_food_from_text(message, raw_text):
+            return
+
+    if added_items:
+        totals = get_today_totals(message.from_user.id)
+
+        total_cal = sum(item[2]["calories"] for item in added_items)
+        total_p = sum(item[2]["protein"] for item in added_items)
+        total_f = sum(item[2]["fat"] for item in added_items)
+        total_c = sum(item[2]["carbs"] for item in added_items)
+
+        if len(added_items) == 1:
+            food, grams, nutrition = added_items[0]
+            answer = (
+                f"✅ Добавлено: {food['name']} {grams:g} г\n\n"
+                f"🔥 {nutrition['calories']:.1f} ккал\n"
+                f"🥩 Б: {nutrition['protein']:.1f} г\n"
+                f"🥑 Ж: {nutrition['fat']:.1f} г\n"
+                f"🍚 У: {nutrition['carbs']:.1f} г\n\n"
+                f"📊 За сегодня: {totals['calories']:.1f} ккал"
+            )
         else:
-            await message.answer("Не нашёл продукт 😕\nПопробуй: курица вареная 150\nрис вареный 200\nчечевица 180", reply_markup=main_menu())
+            answer = f"✅ Добавлено {len(added_items)} продукта:\n\n"
+
+            for food, grams, nutrition in added_items:
+                answer += f"• {food['name']} {grams:g} г — {nutrition['calories']:.1f} ккал\n"
+
+            answer += (
+                "\nИтого за сообщение:\n"
+                f"🔥 {total_cal:.1f} ккал\n"
+                f"🥩 Б: {total_p:.1f} г\n"
+                f"🥑 Ж: {total_f:.1f} г\n"
+                f"🍚 У: {total_c:.1f} г\n\n"
+                f"📊 За сегодня: {totals['calories']:.1f} ккал"
+            )
+
+        if suggestion_items:
+            answer += "\n\n⚠️ Не добавил неоднозначные строки:\n"
+            for original, grams, suggestions in suggestion_items[:3]:
+                answer += f"\n«{original}» — напиши точнее, например:\n"
+                for item in suggestions[:4]:
+                    answer += f"• {item['name']} {grams:g}\n"
+
+        if failed_items:
+            answer += "\n\n⚠️ Не понял:\n"
+            for item in failed_items[:5]:
+                answer += f"• {item}\n"
+
+        await message.answer(answer, reply_markup=main_menu())
         return
 
-    nutrition = calc_nutrition(food, grams)
-    supabase.table("food_logs").insert({
-        "telegram_id": message.from_user.id, "food": food["name"], "grams": grams,
-        "calories": nutrition["calories"], "protein": nutrition["protein"],
-        "fat": nutrition["fat"], "carbs": nutrition["carbs"], "date": str(date.today())
-    }).execute()
-    totals = get_today_totals(message.from_user.id)
+    if suggestion_items:
+        if len(suggestion_items) == 1:
+            original, grams, suggestions = suggestion_items[0]
+            await message.answer(format_food_suggestions(suggestions, grams), reply_markup=main_menu())
+            return
+
+        answer = "Я нашёл неоднозначные строки. Напиши точнее:\n"
+        for original, grams, suggestions in suggestion_items[:5]:
+            answer += f"\n«{original}»:\n"
+            for item in suggestions[:3]:
+                answer += f"• {item['name']} {grams:g}\n"
+
+        await message.answer(answer, reply_markup=main_menu())
+        return
 
     await message.answer(
-        f"✅ Добавлено: {food['name']} {grams:g} г\n\n"
-        f"🔥 {nutrition['calories']:.1f} ккал\n"
-        f"🥩 Б: {nutrition['protein']:.1f} г\n"
-        f"🥑 Ж: {nutrition['fat']:.1f} г\n"
-        f"🍚 У: {nutrition['carbs']:.1f} г\n\n"
-        f"📊 За сегодня: {totals['calories']:.1f} ккал",
-        reply_markup=main_menu(),
+        "Не нашёл продукт 😕\n\n"
+        "Попробуй так:\n"
+        + random_food_example()
+        + "\n\nИли списком:\n"
+        + random_list_example()
+        + ("\n\n🤖 AI-помощник выключен: добавь GEMINI_API_KEY в Render." if not gemini_client else ""),
+        reply_markup=main_menu()
     )
+    return
 
 async def main():
     print("Bot started", flush=True)
