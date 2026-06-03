@@ -1,3 +1,5 @@
 aiogram
 supabase
 flask
+google-genai
+requests
