@@ -139,7 +139,6 @@ async def handle_message(message: types.Message):
     if not message.text:
         await message.answer("Пока я понимаю только текст. Фото еды добавим следующим этапом 📸")
         return
-
     text = normalize_text(message.text)
 
     if text == "/start":
