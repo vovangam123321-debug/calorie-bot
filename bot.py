@@ -3,17 +3,23 @@ import os
 import re
 import random
 import threading
+import io
+import json
+import requests
 from datetime import date
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from flask import Flask
+from google import genai
+from google.genai import types as genai_types
 from supabase import create_client
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
@@ -21,6 +27,9 @@ if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is missing.")
 if not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_KEY is missing.")
+
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -335,6 +344,341 @@ def day_text(telegram_id):
     answer += f"🍚 Углеводы: {totals['carbs']:.1f}" + (f" / {carbs_goal:g}" if carbs_goal else "") + " г"
     return answer
 
+
+def barcode_lookup(barcode: str):
+    try:
+        url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if data.get("status") != 1:
+            return None
+
+        product = data.get("product", {})
+        nutr = product.get("nutriments", {})
+        name = product.get("product_name_ru") or product.get("product_name") or product.get("generic_name_ru") or product.get("generic_name") or f"продукт {barcode}"
+
+        kcal = nutr.get("energy-kcal_100g") or nutr.get("energy-kcal")
+        protein = nutr.get("proteins_100g") or 0
+        fat = nutr.get("fat_100g") or 0
+        carbs = nutr.get("carbohydrates_100g") or 0
+
+        if kcal is None:
+            energy_kj = nutr.get("energy_100g")
+            kcal = float(energy_kj) / 4.184 if energy_kj else None
+        if kcal is None:
+            return None
+
+        return {
+            "name": normalize_text(name)[:120],
+            "kcal_per_100g": float(kcal),
+            "protein_per_100g": float(protein or 0),
+            "fat_per_100g": float(fat or 0),
+            "carbs_per_100g": float(carbs or 0),
+            "category": "barcode",
+        }
+    except Exception as e:
+        print("BARCODE ERROR:", e, flush=True)
+        return None
+
+
+def upsert_food_from_external(food):
+    try:
+        supabase.table("food_db").upsert({
+            "name": food["name"],
+            "kcal_per_100g": food["kcal_per_100g"],
+            "protein_per_100g": food["protein_per_100g"],
+            "fat_per_100g": food["fat_per_100g"],
+            "carbs_per_100g": food["carbs_per_100g"],
+            "category": food.get("category", "external"),
+        }, on_conflict="name").execute()
+    except Exception as e:
+        print("UPSERT FOOD ERROR:", e, flush=True)
+
+
+def ai_text_food_guess(user_text: str):
+    if not gemini_client:
+        return None
+    try:
+        prompt = f"""
+Ты помощник для Telegram-бота NutriFlow.
+Пользователь написал еду, возможно с ошибками, сленгом, в неправильном порядке.
+
+Верни ТОЛЬКО JSON массив.
+Каждый элемент:
+{{"name": "нормальное русское название продукта или блюда", "grams": число_граммов}}
+
+Правила:
+- если вес не указан, grams = null
+- исправляй ошибки: "чичевица" -> "чечевица", "картоха" -> "картошка"
+- если несколько блюд, верни несколько элементов
+- не добавляй пояснения
+
+Текст пользователя: {user_text}
+"""
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        raw = resp.text.strip()
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(raw)
+        return parsed[:8] if isinstance(parsed, list) else None
+    except Exception as e:
+        print("AI TEXT ERROR:", e, flush=True)
+        return None
+
+
+def ai_estimate_food_nutrition(name: str):
+    if not gemini_client:
+        return None
+    try:
+        prompt = f"""
+Оцени примерное КБЖУ на 100 грамм для продукта/блюда: {name}
+
+Верни ТОЛЬКО JSON:
+{{
+  "name": "нормальное название на русском",
+  "kcal_per_100g": число,
+  "protein_per_100g": число,
+  "fat_per_100g": число,
+  "carbs_per_100g": число
+}}
+
+Без пояснений.
+"""
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        raw = resp.text.strip()
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        item = json.loads(raw)
+        item["name"] = normalize_text(item["name"])[:120]
+        item["category"] = "ai_estimate"
+        return item
+    except Exception as e:
+        print("AI NUTRITION ERROR:", e, flush=True)
+        return None
+
+
+async def try_ai_add_food_from_text(message: types.Message, original_text: str):
+    guesses = ai_text_food_guess(original_text)
+    if not guesses:
+        return False
+
+    added = []
+    unclear = []
+
+    for g in guesses:
+        name = normalize_text(str(g.get("name", "")))
+        grams = g.get("grams")
+
+        if not name or grams is None:
+            unclear.append(name or original_text)
+            continue
+
+        try:
+            grams = float(grams)
+        except Exception:
+            unclear.append(name)
+            continue
+
+        food, suggestions = find_food(name)
+        if not food:
+            estimated = ai_estimate_food_nutrition(name)
+            if not estimated:
+                unclear.append(name)
+                continue
+            upsert_food_from_external(estimated)
+            food = estimated
+
+        nutrition = calc_nutrition(food, grams)
+        supabase.table("food_logs").insert({
+            "telegram_id": message.from_user.id,
+            "food": food["name"],
+            "grams": grams,
+            "calories": nutrition["calories"],
+            "protein": nutrition["protein"],
+            "fat": nutrition["fat"],
+            "carbs": nutrition["carbs"],
+            "date": str(date.today())
+        }).execute()
+        added.append((food, grams, nutrition))
+
+    if not added:
+        return False
+
+    totals = get_today_totals(message.from_user.id)
+    answer = "🤖 Я понял через AI и добавил:\n\n"
+    for food, grams, nutrition in added:
+        answer += f"• {food['name']} {grams:g} г — {nutrition['calories']:.1f} ккал\n"
+
+    answer += f"\n📊 За сегодня: {totals['calories']:.1f} ккал"
+
+    if unclear:
+        answer += "\n\n⚠️ Не смог уверенно понять:\n" + "\n".join(f"• {x}" for x in unclear[:5])
+
+    answer += "\n\nОценка AI примерная, для точности лучше уточняй вес."
+    await message.answer(answer, reply_markup=main_menu())
+    return True
+
+
+async def analyze_photo_with_ai(message: types.Message):
+    if not gemini_client:
+        await message.answer(
+            "AI-фото пока не включено. Добавь GEMINI_API_KEY в Render Environment Variables.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        bio = io.BytesIO()
+        await bot.download_file(file.file_path, destination=bio)
+        prompt = """
+Ты NutriFlow AI. Проанализируй фото.
+Это может быть еда, меню ресторана, штрихкод или упаковка.
+
+Верни ТОЛЬКО JSON:
+{
+  "type": "food" | "menu" | "barcode" | "unknown",
+  "barcode": "цифры если виден штрихкод иначе null",
+  "items": [
+    {
+      "name": "название блюда/продукта на русском",
+      "estimated_grams": число или null,
+      "kcal_per_100g": число,
+      "protein_per_100g": число,
+      "fat_per_100g": число,
+      "carbs_per_100g": число,
+      "confidence": 0.0-1.0
+    }
+  ],
+  "comment": "короткий комментарий"
+}
+
+Если это меню ресторана — верни несколько блюд из меню с примерной калорийностью на 100г, grams=null.
+Если это еда на тарелке — оцени вес примерно.
+Если вес не уверен — estimated_grams=null.
+"""
+
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                prompt,
+                genai_types.Part.from_bytes(
+                    data=bio.getvalue(),
+                    mime_type="image/jpeg",
+                ),
+            ],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+
+        raw = resp.text.strip()
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        data = json.loads(raw)
+
+        if data.get("type") == "barcode" and data.get("barcode"):
+            product = barcode_lookup(str(data["barcode"]))
+            if product:
+                upsert_food_from_external(product)
+                await message.answer(
+                    "🔎 Нашёл по штрихкоду:\n\n"
+                    f"• {product['name']}\n"
+                    f"🔥 {product['kcal_per_100g']:.1f} ккал / 100г\n"
+                    f"🥩 Б: {product['protein_per_100g']:.1f} г\n"
+                    f"🥑 Ж: {product['fat_per_100g']:.1f} г\n"
+                    f"🍚 У: {product['carbs_per_100g']:.1f} г\n\n"
+                    "Напиши вес, например:\n"
+                    f"{product['name']} 120",
+                    reply_markup=main_menu(),
+                )
+                return
+
+        items = data.get("items") or []
+        if not items:
+            await message.answer("Не смог уверенно распознать фото 😕 Попробуй сфоткать ближе и светлее.", reply_markup=main_menu())
+            return
+
+        if data.get("type") == "menu":
+            answer = "📋 Похоже на меню. Примерная оценка блюд:\n\n"
+            for item in items[:8]:
+                answer += (
+                    f"• {normalize_text(item.get('name','блюдо'))}\n"
+                    f"  🔥 ~{float(item.get('kcal_per_100g') or 0):.0f} ккал / 100г\n"
+                )
+            answer += "\nНапиши блюдо и вес, например:\nпаста карбонара 300"
+            await message.answer(answer, reply_markup=main_menu())
+            return
+
+        added = []
+        needs_weight = []
+        for item in items[:5]:
+            name = normalize_text(item.get("name", "еда"))
+            grams = item.get("estimated_grams")
+            food = {
+                "name": name,
+                "kcal_per_100g": float(item.get("kcal_per_100g") or 0),
+                "protein_per_100g": float(item.get("protein_per_100g") or 0),
+                "fat_per_100g": float(item.get("fat_per_100g") or 0),
+                "carbs_per_100g": float(item.get("carbs_per_100g") or 0),
+                "category": "photo_ai",
+            }
+            upsert_food_from_external(food)
+            if grams is None:
+                needs_weight.append(food)
+                continue
+
+            grams = float(grams)
+            nutrition = calc_nutrition(food, grams)
+            supabase.table("food_logs").insert({
+                "telegram_id": message.from_user.id,
+                "food": food["name"],
+                "grams": grams,
+                "calories": nutrition["calories"],
+                "protein": nutrition["protein"],
+                "fat": nutrition["fat"],
+                "carbs": nutrition["carbs"],
+                "date": str(date.today())
+            }).execute()
+            added.append((food, grams, nutrition))
+
+        if added:
+            totals = get_today_totals(message.from_user.id)
+            answer = "📸 Распознал фото и добавил примерно:\n\n"
+            for food, grams, nutrition in added:
+                answer += f"• {food['name']} {grams:g} г — {nutrition['calories']:.1f} ккал\n"
+            answer += f"\n📊 За сегодня: {totals['calories']:.1f} ккал"
+            answer += "\n\n⚠️ Вес и КБЖУ по фото примерные."
+            await message.answer(answer, reply_markup=main_menu())
+            return
+
+        if needs_weight:
+            answer = "📸 Похоже на:\n\n"
+            for food in needs_weight:
+                answer += f"• {food['name']} — ~{food['kcal_per_100g']:.0f} ккал / 100г\n"
+            answer += "\nНапиши вес, например:\n" + f"{needs_weight[0]['name']} 250"
+            await message.answer(answer, reply_markup=main_menu())
+            return
+
+        await message.answer("Не смог уверенно посчитать фото 😕", reply_markup=main_menu())
+
+    except Exception as e:
+        print("PHOTO AI ERROR:", e, flush=True)
+        await message.answer("Фото не получилось разобрать 😕 Попробуй другое фото.", reply_markup=main_menu())
+
 async def start_onboarding(message):
     get_or_create_user(message)
     update_user(message.from_user.id, {"onboarding_step": "gender", "waiting_for": None})
@@ -393,14 +737,22 @@ async def setting_callback(callback):
         await callback.message.answer("Выбери пол:", reply_markup=gender_keyboard())
     await callback.answer()
 
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    print("PHOTO MESSAGE", flush=True)
+    await message.answer("📸 Анализирую фото, секунду...")
+    await analyze_photo_with_ai(message)
+
+
 @dp.message()
 async def handle_message(message: types.Message):
     print("MESSAGE:", message.text, flush=True)
     if not message.text:
-        await message.answer("Пока я понимаю только текст. Фото еды добавим следующим этапом 📸")
+        await message.answer("Пока я понимаю текст и фото еды/меню 📸", reply_markup=main_menu())
         return
 
-    text = normalize_text(message.text)
+    raw_text = message.text.strip()
+    text = normalize_text(raw_text)
     user = get_or_create_user(message)
     waiting_for = user.get("waiting_for")
 
@@ -494,7 +846,12 @@ async def handle_message(message: types.Message):
             await message.answer(chunk, reply_markup=main_menu())
         return
     if text in ("/help", "помощь"):
-        await message.answer("Примеры одного продукта:\n" + random_food_example() + "\n\nМожно списком:\n" + random_list_example(), reply_markup=main_menu()); return
+        await message.answer(
+            "Примеры одного продукта:\n" + random_food_example()
+            + "\n\nМожно списком:\n" + random_list_example()
+            + "\n\nЕщё можно отправить фото еды, фото меню или штрихкод цифрами.",
+            reply_markup=main_menu()
+        ); return
 
     food_name, grams = parse_food_message(text)
     if food_name is None or grams is None:
