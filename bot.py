@@ -14,24 +14,23 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError("BOT_TOKEN is missing. Add it in Render Environment Variables.")
 if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL is not set")
+    raise RuntimeError("SUPABASE_URL is missing. Add it in Render Environment Variables.")
 if not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_KEY is not set")
+    raise RuntimeError("SUPABASE_KEY is missing. Add it in Render Environment Variables.")
 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-# Мини-веб-сервер нужен Render, чтобы Web Service видел открытый порт.
 app = Flask(__name__)
+
 
 @app.route("/")
 def home():
-    return "NutriFlow bot is running"
+    return "Bot is running"
 
 
 def run_web():
@@ -54,10 +53,14 @@ def parse_food_message(text: str):
     рис 200г
     рис 200 г
     рис 200 грамм
+    съел банан 200 грамм
     куриная грудка вареная 150
     chicken fried 180g
     """
     text = normalize_text(text)
+
+    # Убираем лишние слова в начале
+    text = re.sub(r"^(я\s+)?(съел|съела|поел|поела|ем|добавь|добавить|запиши|записать)\s+", "", text)
 
     # Убираем слова грамм/г/гр/g, но оставляем число
     text = re.sub(r"(\d+(?:\.\d+)?)\s*(грамм|грамма|граммов|гр|г|grams|gram|g)\b", r"\1", text)
@@ -75,27 +78,67 @@ def parse_food_message(text: str):
     return food_name, grams
 
 
+def get_food_exact(food_name: str):
+    result = supabase.table("food_db").select("*").eq("name", food_name).execute()
+    return result.data[0] if result.data else None
+
+
+def find_food_by_alias(food_name: str):
+    food_name = normalize_text(food_name)
+    alias = supabase.table("food_aliases").select("*").eq("alias", food_name).execute()
+    if not alias.data:
+        return None
+    target_name = alias.data[0]["target_name"]
+    return get_food_exact(target_name)
+
+
 def find_food(food_name: str):
     food_name = normalize_text(food_name)
 
-    # 1) точное совпадение
-    exact = supabase.table("food_db").select("*").eq("name", food_name).execute()
-    if exact.data:
-        return exact.data[0], []
+    # 1) alias exact
+    alias_food = find_food_by_alias(food_name)
+    if alias_food:
+        return alias_food, []
 
-    # 2) мягкий поиск по части названия
-    search = supabase.table("food_db").select("*").ilike("name", f"%{food_name}%").limit(8).execute()
+    # 2) exact food name
+    exact = get_food_exact(food_name)
+    if exact:
+        return exact, []
+
+    # 3) soft contains search
+    search = supabase.table("food_db").select("*").ilike("name", f"%{food_name}%").limit(10).execute()
     if search.data:
         if len(search.data) == 1:
             return search.data[0], []
         return None, search.data
 
-    # 3) если написали "курица", покажем все виды курицы
-    words = food_name.split()
-    if words:
-        search = supabase.table("food_db").select("*").ilike("name", f"%{words[0]}%").limit(8).execute()
-        if search.data:
-            return None, search.data
+    # 4) word-based search: try each word
+    words = [w for w in food_name.split() if len(w) > 2]
+    suggestions = []
+    seen = set()
+    for word in words:
+        # aliases by word
+        alias_rows = supabase.table("food_aliases").select("*").ilike("alias", f"%{word}%").limit(5).execute()
+        for row in alias_rows.data or []:
+            target = row.get("target_name")
+            if target and target not in seen:
+                f = get_food_exact(target)
+                if f:
+                    suggestions.append(f)
+                    seen.add(target)
+
+        # foods by word
+        food_rows = supabase.table("food_db").select("*").ilike("name", f"%{word}%").limit(5).execute()
+        for f in food_rows.data or []:
+            if f["name"] not in seen:
+                suggestions.append(f)
+                seen.add(f["name"])
+
+        if len(suggestions) >= 10:
+            break
+
+    if suggestions:
+        return None, suggestions[:10]
 
     return None, []
 
@@ -150,7 +193,7 @@ def get_or_create_user(message):
         "carbs_goal": 0,
         "weight": 0,
         "target_weight": 0,
-        "waiting_for": None,
+        "waiting_for": None
     }
 
     created = supabase.table("users").insert(new_user).execute()
@@ -171,12 +214,8 @@ def format_food_suggestions(items, grams=None):
     return text
 
 
-def fmt_goal(current, goal, unit):
-    if goal and goal > 0:
-        left = goal - current
-        sign = "осталось" if left >= 0 else "перебор"
-        return f"{current:.1f} / {goal:g} {unit} ({sign}: {abs(left):.1f})"
-    return f"{current:.1f} {unit}"
+def fmt_goal(value):
+    return f"{value:g}" if value else "не задано"
 
 
 @dp.message()
@@ -187,15 +226,73 @@ async def handle_message(message: types.Message):
         await message.answer("Пока я понимаю только текст. Фото еды добавим следующим этапом 📸")
         return
 
-    raw_text = message.text.strip()
-    text = normalize_text(raw_text)
+    text = normalize_text(message.text)
     user = get_or_create_user(message)
+    waiting_for = user.get("waiting_for")
 
-    if text == "/cancel":
-        update_user(message.from_user.id, {"waiting_for": None})
-        await message.answer("Ок, отменил действие.")
+    # Waiting states
+    if waiting_for == "weight":
+        try:
+            weight = float(text.replace(",", "."))
+        except ValueError:
+            await message.answer("Напиши вес числом. Например: 82")
+            return
+
+        update_user(message.from_user.id, {"weight": weight, "waiting_for": None})
+        protein_goal = weight * 1.6
+
+        await message.answer(
+            f"⚖️ Вес сохранён: {weight:g} кг\n"
+            f"🥩 Рекомендованная цель по белку: ~{protein_goal:.0f} г/день"
+        )
         return
 
+    if waiting_for == "target_weight":
+        try:
+            target_weight = float(text.replace(",", "."))
+        except ValueError:
+            await message.answer("Напиши цель по весу числом. Например: 75")
+            return
+
+        update_user(message.from_user.id, {"target_weight": target_weight, "waiting_for": None})
+        await message.answer(f"🎯 Цель по весу сохранена: {target_weight:g} кг")
+        return
+
+    if waiting_for == "kbju_goal":
+        parts = text.split()
+        if len(parts) != 4:
+            await message.answer(
+                "Нужно 4 числа:\n"
+                "калории белки жиры углеводы\n\n"
+                "Например:\n"
+                "2400 160 80 260"
+            )
+            return
+
+        try:
+            calories, protein, fat, carbs = [float(x.replace(",", ".")) for x in parts]
+        except ValueError:
+            await message.answer("Все значения должны быть числами. Например: 2400 160 80 260")
+            return
+
+        update_user(message.from_user.id, {
+            "daily_goal": calories,
+            "protein_goal": protein,
+            "fat_goal": fat,
+            "carbs_goal": carbs,
+            "waiting_for": None
+        })
+
+        await message.answer(
+            "🎯 Цели сохранены:\n\n"
+            f"🔥 Калории: {calories:g} ккал\n"
+            f"🥩 Белки: {protein:g} г\n"
+            f"🥑 Жиры: {fat:g} г\n"
+            f"🍚 Углеводы: {carbs:g} г"
+        )
+        return
+
+    # Commands
     if text == "/start":
         await message.answer(
             "Привет 👋\n\n"
@@ -203,6 +300,7 @@ async def handle_message(message: types.Message):
             "Пиши так:\n"
             "• рис вареный 200\n"
             "• курица жареная 150г\n"
+            "• съел банан 200 грамм\n"
             "• chicken fried 180g\n\n"
             "Команды:\n"
             "/day — итог за сегодня\n"
@@ -211,9 +309,8 @@ async def handle_message(message: types.Message):
             "/delete — удалить последнюю запись\n"
             "/weight — изменить вес\n"
             "/target_weight — цель по весу\n"
-            "/goal — цель по калориям и КБЖУ\n"
-            "/profile — твои настройки\n"
-            "/cancel — отменить ввод"
+            "/goal — цель по КБЖУ\n"
+            "/profile — твой профиль"
         )
         return
 
@@ -239,20 +336,19 @@ async def handle_message(message: types.Message):
 
     if text == "/profile":
         user = get_or_create_user(message)
-
         await message.answer(
             "👤 Профиль:\n\n"
-            f"⚖️ Вес: {user.get('weight') or 0:g} кг\n"
-            f"🎯 Цель по весу: {user.get('target_weight') or 0:g} кг\n\n"
-            f"🔥 Калории: {user.get('daily_goal') or 2000:g} ккал\n"
-            f"🥩 Белки: {user.get('protein_goal') or 0:g} г\n"
-            f"🥑 Жиры: {user.get('fat_goal') or 0:g} г\n"
-            f"🍚 Углеводы: {user.get('carbs_goal') or 0:g} г"
+            f"⚖️ Вес: {fmt_goal(user.get('weight') or 0)} кг\n"
+            f"🎯 Цель по весу: {fmt_goal(user.get('target_weight') or 0)} кг\n\n"
+            f"🔥 Калории: {fmt_goal(user.get('daily_goal') or 2000)} ккал\n"
+            f"🥩 Белки: {fmt_goal(user.get('protein_goal') or 0)} г\n"
+            f"🥑 Жиры: {fmt_goal(user.get('fat_goal') or 0)} г\n"
+            f"🍚 Углеводы: {fmt_goal(user.get('carbs_goal') or 0)} г"
         )
         return
 
     if text == "/foods":
-        result = supabase.table("food_db").select("name").order("name").limit(120).execute()
+        result = supabase.table("food_db").select("name").order("name").limit(300).execute()
         foods = [x["name"] for x in result.data]
 
         chunks = []
@@ -278,18 +374,34 @@ async def handle_message(message: types.Message):
         fat_goal = user.get("fat_goal") or 0
         carbs_goal = user.get("carbs_goal") or 0
 
-        await message.answer(
+        left = daily_goal - totals["calories"]
+
+        answer = (
             "📊 Сегодня:\n\n"
-            f"🔥 Калории: {fmt_goal(totals['calories'], daily_goal, 'ккал')}\n"
-            f"🥩 Белки: {fmt_goal(totals['protein'], protein_goal, 'г')}\n"
-            f"🥑 Жиры: {fmt_goal(totals['fat'], fat_goal, 'г')}\n"
-            f"🍚 Углеводы: {fmt_goal(totals['carbs'], carbs_goal, 'г')}"
+            f"🔥 Калории: {totals['calories']:.1f} / {daily_goal:g} ккал\n"
+            f"📉 Осталось: {left:.1f} ккал\n"
         )
+
+        if protein_goal:
+            answer += f"🥩 Белки: {totals['protein']:.1f} / {protein_goal:g} г\n"
+        else:
+            answer += f"🥩 Белки: {totals['protein']:.1f} г\n"
+
+        if fat_goal:
+            answer += f"🥑 Жиры: {totals['fat']:.1f} / {fat_goal:g} г\n"
+        else:
+            answer += f"🥑 Жиры: {totals['fat']:.1f} г\n"
+
+        if carbs_goal:
+            answer += f"🍚 Углеводы: {totals['carbs']:.1f} / {carbs_goal:g} г"
+        else:
+            answer += f"🍚 Углеводы: {totals['carbs']:.1f} г"
+
+        await message.answer(answer)
         return
 
     if text == "/delete":
         logs = get_today_logs(message.from_user.id)
-
         if not logs:
             await message.answer("Сегодня нечего удалять.")
             return
@@ -313,90 +425,13 @@ async def handle_message(message: types.Message):
         for item in logs:
             answer += (
                 f"• {item['food']} {item['grams']:g} г — "
-                f"{item['calories']:.1f} ккал\n"
+                f"{item['calories']:.1f} ккал "
+                f"(Б {item.get('protein', 0):.1f} / Ж {item.get('fat', 0):.1f} / У {item.get('carbs', 0):.1f})\n"
             )
         await message.answer(answer)
         return
 
-    # Диалоговые ответы после команд /weight, /target_weight, /goal
-    waiting_for = user.get("waiting_for")
-
-    if waiting_for == "weight":
-        try:
-            weight = float(text.replace(",", "."))
-        except ValueError:
-            await message.answer("Напиши вес числом. Например: 82\n\n/cancel — отменить")
-            return
-
-        update_user(message.from_user.id, {"weight": weight, "waiting_for": None})
-        protein_goal = weight * 1.6
-
-        await message.answer(
-            f"⚖️ Вес сохранён: {weight:g} кг\n"
-            f"🥩 Ориентир по белку: ~{protein_goal:.0f} г/день"
-        )
-        return
-
-    if waiting_for == "target_weight":
-        try:
-            target_weight = float(text.replace(",", "."))
-        except ValueError:
-            await message.answer("Напиши цель по весу числом. Например: 75\n\n/cancel — отменить")
-            return
-
-        update_user(message.from_user.id, {"target_weight": target_weight, "waiting_for": None})
-
-        weight = user.get("weight") or 0
-        if weight:
-            diff = target_weight - weight
-            if diff < 0:
-                msg = f"🎯 Цель по весу сохранена: {target_weight:g} кг\n📉 Нужно снизить: {abs(diff):.1f} кг"
-            elif diff > 0:
-                msg = f"🎯 Цель по весу сохранена: {target_weight:g} кг\n📈 Нужно набрать: {diff:.1f} кг"
-            else:
-                msg = f"🎯 Цель по весу сохранена: {target_weight:g} кг\n✅ Ты уже на цели"
-        else:
-            msg = f"🎯 Цель по весу сохранена: {target_weight:g} кг"
-
-        await message.answer(msg)
-        return
-
-    if waiting_for == "kbju_goal":
-        parts = text.split()
-
-        if len(parts) != 4:
-            await message.answer(
-                "Нужно 4 числа:\n"
-                "калории белки жиры углеводы\n\n"
-                "Например:\n"
-                "2400 160 80 260\n\n"
-                "/cancel — отменить"
-            )
-            return
-
-        try:
-            calories, protein, fat, carbs = [float(x.replace(",", ".")) for x in parts]
-        except ValueError:
-            await message.answer("Все значения должны быть числами. Например: 2400 160 80 260")
-            return
-
-        update_user(message.from_user.id, {
-            "daily_goal": calories,
-            "protein_goal": protein,
-            "fat_goal": fat,
-            "carbs_goal": carbs,
-            "waiting_for": None,
-        })
-
-        await message.answer(
-            "🎯 Цели сохранены:\n\n"
-            f"🔥 Калории: {calories:g} ккал\n"
-            f"🥩 Белки: {protein:g} г\n"
-            f"🥑 Жиры: {fat:g} г\n"
-            f"🍚 Углеводы: {carbs:g} г"
-        )
-        return
-
+    # Food input
     food_name, grams = parse_food_message(text)
 
     if food_name is None or grams is None:
@@ -404,10 +439,9 @@ async def handle_message(message: types.Message):
             "Пиши так:\n"
             "рис вареный 200\n"
             "курица жареная 150г\n"
-            "chicken baked 180g\n\n"
-            "Команды:\n"
-            "/weight — изменить вес\n"
-            "/goal — настроить цели"
+            "съел банан 200 грамм\n"
+            "чечевица 180\n"
+            "chicken baked 180g"
         )
         return
 
@@ -422,7 +456,8 @@ async def handle_message(message: types.Message):
                 "Попробуй точнее, например:\n"
                 "курица вареная 150\n"
                 "курица жареная 150\n"
-                "рис вареный 200"
+                "рис вареный 200\n"
+                "чечевица вареная 180"
             )
         return
 
@@ -436,7 +471,7 @@ async def handle_message(message: types.Message):
         "protein": nutrition["protein"],
         "fat": nutrition["fat"],
         "carbs": nutrition["carbs"],
-        "date": str(date.today()),
+        "date": str(date.today())
     }).execute()
 
     totals = get_today_totals(message.from_user.id)
@@ -457,5 +492,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=run_web).start()
     asyncio.run(main())
