@@ -143,19 +143,20 @@ async def handle_message(message: types.Message):
     text = normalize_text(message.text)
 
     if text == "/start":
-        await message.answer(
-            "Привет 👋\n\n"
-            "Я считаю калории и КБЖУ.\n\n"
-            "Пиши так:\n"
-            "• рис вареный 200\n"
-            "• курица жареная 150г\n"
-            "• chicken fried 180g\n\n"
-            "Команды:\n"
-            "/day — итог за сегодня\n"
-            "/foods — список продуктов\n"
-            "/history — что ты ел сегодня"
-        )
-        return
+    await message.answer(
+        "Привет 👋\n\n"
+        "Я считаю калории и КБЖУ.\n\n"
+        "Пиши так:\n"
+        "• рис вареный 200\n"
+        "• курица жареная 150г\n"
+        "• chicken fried 180g\n\n"
+        "Команды:\n"
+        "/day — итог за сегодня\n"
+        "/foods — список продуктов\n"
+        "/history — что ты ел сегодня\n"
+        "/delete — удалить последнюю запись"
+    )
+    return
 
     if text == "/foods":
         result = supabase.table("food_db").select("name").order("name").limit(120).execute()
@@ -185,7 +186,24 @@ async def handle_message(message: types.Message):
             f"🍚 Углеводы: {totals['carbs']:.1f} г"
         )
         return
+        
+    if text == "/delete":
+        logs = get_today_logs(message.from_user.id)
 
+        if not logs:
+            await message.answer("Сегодня нечего удалять.")
+            return
+
+        last = logs[-1]
+
+        supabase.table("food_logs").delete().eq("id", last["id"]).execute()
+
+        await message.answer(
+            f"🗑 Удалил последнюю запись:\n"
+            f"{last['food']} {last['grams']:g} г — {last['calories']:.1f} ккал"
+        )
+        return
+        
     if text == "/history":
         logs = get_today_logs(message.from_user.id)
         if not logs:
