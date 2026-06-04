@@ -847,6 +847,8 @@ async def handle_message(message: types.Message):
         update_user(message.from_user.id, {"daily_goal": calories, "protein_goal": protein, "fat_goal": fat, "carbs_goal": carbs, "waiting_for": None})
         await message.answer(f"🎯 Цели сохранены:\n🔥 {calories:g} ккал\n🥩 {protein:g} г\n🥑 {fat:g} г\n🍚 {carbs:g} г", reply_markup=main_menu()); return
 
+    if text == "/appss_verify":
+        await message.answer("appss_47019e"); return
     if text in ("/start", "🔁 начать заново"):
         await start_onboarding(message); return
     if text in ("➕ добавить еду", "/add"):
